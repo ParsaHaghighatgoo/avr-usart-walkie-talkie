@@ -39,8 +39,13 @@ avrdude -p m32 -c usbasp -U flash:w:main.hex
 ```
 
 [env:atmega32]
+
 platform = atmelavr
+
 board = ATmega32
+
 framework = arduino
+
 board_build.f_cpu = 8000000L
+
 upload_protocol = custom
