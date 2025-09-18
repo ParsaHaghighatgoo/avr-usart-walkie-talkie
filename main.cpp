@@ -1,0 +1,546 @@
+//---------------------------------------------
+//CPU Frequency 
+#define F_CPU 8000000UL
+
+//---------------------------------------------
+//Libraries
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <avr/sleep.h>
+#include <avr/power.h>
+#include <stddef.h>
+
+//---------------------------------------------
+//LCD Section
+#define LCD_DATA PORTC
+#define ctrl PORTA
+#define en PA2
+#define rw PA1
+#define rs PA0
+
+void LCD_cmd(unsigned char cmd);
+void LCD_write(unsigned char data);
+void init_LCD(void)
+{
+    LCD_cmd(0x38);
+    _delay_ms(1);
+    LCD_cmd(0x01);
+    _delay_ms(1);
+    LCD_cmd(0x0E);
+    _delay_ms(1);
+    LCD_cmd(0x80);
+    _delay_ms(1);
+}
+
+void LCD_cmd(unsigned char cmd)
+{
+    LCD_DATA = cmd;
+    ctrl = (0<<rs) | (0<<rw) | (1<<en);
+    _delay_ms(1);
+    ctrl = 0x00;
+    _delay_ms(2);
+}
+
+void LCD_write(unsigned char data)
+{
+    LCD_DATA = data;
+    ctrl = (1<<rs) | (0<<rw) | (1<<en);
+    _delay_ms(1);
+    ctrl = (1<<rs) | (0<<rw) | (0<<en);
+    _delay_ms(2);
+}
+
+//-----------------------------------------
+//Messages 
+#define SYNC_CODE 0xAA
+const char *msg_H = "HELP :(";
+const char *msg_O = "OVER :)";
+const char *msg_R = "Roger That :D";
+const char *msg_S = "Stand By XD";
+const char *msg_A = "ACK :)";
+const char *msg_B = "BUSY :|";
+const char *msg_Y = "YES!";
+
+
+//---------------------------------------------
+//LED-BIRG Control Section 
+#define RED_PIN   PB3
+#define GREEN_PIN PB4
+
+static inline void LED_Init(void) {
+    // Configure both pins as outputs once
+    DDRB |= (1 << RED_PIN) | (1 << GREEN_PIN);
+}
+
+void LED_Off(void) {
+    LED_Init();
+    // Common-anode: HIGH turns LED off
+    PORTB |= (1 << RED_PIN) | (1 << GREEN_PIN);
+}
+
+void LED_Red(void) {
+    LED_Init();
+    PORTB &= ~(1 << RED_PIN);   // LOW = ON red
+    PORTB |=  (1 << GREEN_PIN); // HIGH = OFF green
+}
+
+void LED_Green(void) {
+    LED_Init();
+    PORTB &= ~(1 << GREEN_PIN); // LOW = ON green
+    PORTB |=  (1 << RED_PIN);   // HIGH = OFF red
+}
+
+//---------------------------------------------
+//ADC Control Section
+#define ADC_PRESCALER    ((1 << ADPS2) | (1 << ADPS1))  // Prescaler = 64
+#define ADC_REF_AVCC     (1 << REFS0)                   // Reference = AVcc
+#define ADC_CHANNEL_MASK 0x07                           // Only lower 3 bits valid
+#define ADC_CLEAR_MASK   0xF8                           // Clear channel bits
+
+void ADC_Init(void) {
+    // Select AVcc as reference, start with channel 0
+    ADMUX  = ADC_REF_AVCC;
+    // Enable ADC with prescaler
+    ADCSRA = (1 << ADEN) | ADC_PRESCALER;
+}
+
+uint16_t ADC_Read(uint8_t channel) {
+    // Keep only the valid channel bits (0–7)
+    channel &= ADC_CHANNEL_MASK;
+    // Set channel while preserving reference selection
+    ADMUX = (ADMUX & ADC_CLEAR_MASK) | channel;
+
+    // Start conversion
+    ADCSRA |= (1 << ADSC);
+    // Wait for conversion to finish
+    while (ADCSRA & (1 << ADSC));
+
+    return ADC; // Return 10-bit result
+}
+
+//---------------------------------------------
+// BAUD_RATE Selection
+
+#define ADC_CHANNEL_POT   3
+#define BAUD_25   4800UL
+#define BAUD_50   9600UL
+#define BAUD_75   19200UL
+#define BAUD_100  115200UL
+
+unsigned long select_channel(void) {
+    uint16_t pot_value = ADC_Read(ADC_CHANNEL_POT);   // Read potentiometer on PA3
+    uint8_t percentage = (uint32_t)pot_value * 100 / 1023; 
+
+    unsigned long baud_rate;
+
+    if (percentage <= 25) {
+        baud_rate = BAUD_25;
+    } else if (percentage <= 50) {
+        baud_rate = BAUD_50;
+    } else if (percentage <= 75) {
+        baud_rate = BAUD_75;
+    } else {
+        baud_rate = BAUD_100;
+    }
+
+    return baud_rate;
+}
+
+//---------------------------------------------
+//USART
+#define USART_DATA_BITS   ((1 << UCSZ1) | (1 << UCSZ0)) // 8-bit data
+#define USART_ENABLE      ((1 << RXEN) | (1 << TXEN) | (1 << RXCIE)) 
+#define USART_URSEL_MASK  (1 << URSEL)  // Needed to write UCSRC
+
+void USART_Init(unsigned long baud) {
+    uint16_t ubrr_value = (F_CPU / (16UL * baud)) - 1;
+
+    // Set baud rate
+    UBRRH = (uint8_t)(ubrr_value >> 8);
+    UBRRL = (uint8_t)(ubrr_value);
+
+    // Enable RX, TX and RX interrupt
+    UCSRB = USART_ENABLE;
+
+    // Set frame: 8 data bits, 1 stop bit, no parity
+    UCSRC = USART_URSEL_MASK | USART_DATA_BITS;
+}
+
+void USART_Transmit(uint8_t data) {
+    // Wait until buffer is empty
+    while (!(UCSRA & (1 << UDRE)));
+    UDR = data;
+}
+
+uint8_t USART_Receive(void) {
+    // Wait until data is received
+    while (!(UCSRA & (1 << RXC)));
+    return UDR;
+}
+
+//---------------------------------------
+//Sleep Function
+static inline void go_to_sleep(void) {
+    // Configure sleep mode
+    sleep_enable();
+    set_sleep_mode(SLEEP_MODE_IDLE);
+
+    // Enter sleep
+    sleep_cpu();
+
+    // Wake-up: disable sleep to avoid accidental re-entry
+    sleep_disable();
+}
+
+//----------------------------------------
+//Timer/Counter
+volatile uint8_t standby_counter   = 0;
+volatile uint8_t send_standby_flag = 0;
+
+// 1 Hz compare value for F_CPU @ prescaler 1024
+#define T1_PRESCALER_BITS   ((1 << CS12) | (1 << CS10))     // 1024
+#define T1_CLEAR_PRESCALER  ((1 << CS12) | (1 << CS11) | (1 << CS10))
+#define T1_CTC_MODE         (1 << WGM12)
+#define T1_OCR1A_1HZ        ((uint16_t)((F_CPU / 1024UL) / 1UL) - 1U) // e.g., 8000000/1024 - 1 = 7812
+
+ISR(TIMER1_COMPA_vect) {
+    standby_counter++;
+    if (standby_counter >= 3) {   // ~1 min
+        send_standby_flag = 1;    // Set flag for main loop
+    }
+}
+
+void Timer1_Init(void) {
+    // Put Timer1 into CTC mode (OCR1A top), with prescaler changes done cleanly
+    TCCR1B &= ~T1_CLEAR_PRESCALER; // stop timer while configuring
+    TCCR1B |= T1_CTC_MODE;
+
+    // 1 Hz tick with F_CPU/1024 prescale
+    OCR1A = T1_OCR1A_1HZ;          // equals 7812 for 8 MHz
+
+    // Enable Compare Match A interrupt
+    TIMSK |= (1 << OCIE1A);
+
+    // Start timer with prescaler = 1024
+    TCCR1B |= T1_PRESCALER_BITS;
+}
+
+//------------------------------------------
+//Interrupts 
+ISR(INT0_vect) {}
+ISR(INT1_vect) {}
+ISR(INT2_vect) {}
+ISR(USART_RXC_vect) {}
+
+//---------------------------------------------
+// BOUNS ONE : encrypt before sending, decrypt at the receiver
+// Simple link-layer encryption (XOR)
+// #define ENC_KEY 0x5A                // <<< choose any 0x00–0xFF; same on both boards
+// static inline uint8_t enc(uint8_t b) { return b ^ ENC_KEY; }
+// static inline uint8_t dec(uint8_t b) { return b ^ ENC_KEY; } // XOR is symmetric
+
+//---------------------------------------------
+// Channels: baud + per-channel encryption key for bouns two
+typedef struct {
+    unsigned long baud;
+    uint8_t       key;
+} Channel;
+
+#define NUM_CHANNELS 8
+static const Channel CHANNELS[NUM_CHANNELS] = {
+    { 4800UL,   0x11 },  // CH0
+    { 9600UL,   0x22 },  // CH1
+    { 19200UL,  0x33 },  // CH2
+    { 38400UL,  0x44 },  // CH3
+    { 57600UL,  0x55 },  // CH4
+    { 76800UL,  0x66 },  // CH5 (ATmega accepts)
+    { 115200UL, 0x77 },  // CH6
+    { 250000UL, 0x88 },  // CH7 (fine in sim; on real HW use 16MHz or pick 57600)
+};
+
+// global “current” key selected by channel
+static uint8_t ENC_KEY_CURRENT = 0x00;
+static inline uint8_t enc(uint8_t b){ return b ^ ENC_KEY_CURRENT; }
+static inline uint8_t dec(uint8_t b){ return b ^ ENC_KEY_CURRENT; }
+
+#define ADC_CHANNEL_POT   3
+
+// Map 0..1023 -> 0..7
+static inline uint8_t channel_index_from_adc(uint16_t v){
+    uint16_t idx = v >> 7;              // /128
+    if (idx >= NUM_CHANNELS) idx = NUM_CHANNELS-1;
+    return (uint8_t)idx;
+}
+
+// Read pot, pick channel, apply baud & key, show on LCD if changed
+static uint8_t g_current_channel = 0xFF;   // invalid to force first update
+void Channel_SelectAndApply(uint8_t show_on_lcd){
+    uint16_t raw = ADC_Read(ADC_CHANNEL_POT);
+    uint8_t idx  = channel_index_from_adc(raw);
+
+    if (idx != g_current_channel) {
+        g_current_channel = idx;
+        ENC_KEY_CURRENT   = CHANNELS[idx].key;
+        USART_Init(CHANNELS[idx].baud);
+        if (show_on_lcd){
+            LCD_cmd(0x01);
+            LCD_write('C'); LCD_write('H');
+            LCD_write('0' + idx);   // CH#
+        }
+    }
+}
+
+//------------------------------------------
+//Send & Receive
+void sendMessage(char code) {
+    unsigned long baud_rate = select_channel();
+    USART_Init(baud_rate);
+
+    USART_Transmit(SYNC_CODE);      // SYNC stays in clear
+    USART_Transmit(enc((uint8_t)code));  // payload is encrypted
+}
+
+void receiveMessage(void) {
+    unsigned long baud_rate = select_channel();
+    USART_Init(baud_rate);
+
+    uint8_t sync_byte = USART_Receive();
+
+    if (sync_byte == SYNC_CODE) {
+        LED_Green();
+
+        uint8_t data_enc = USART_Receive();
+        uint8_t data     = dec(data_enc);      // NEW: decrypt
+
+        const char *msg = NULL;
+        switch (data) {
+            case 'H': msg = msg_H; break;
+            case 'O': msg = msg_O; break;
+            case 'R': msg = msg_R; break;
+            case 'S': msg = msg_S; break;
+            case 'A': msg = msg_A; break;
+            case 'B': msg = msg_B; break;
+            case 'Y': msg = msg_Y; break;
+            default:  msg = "";    break;
+        }
+        LCD_cmd(0x01);
+        for (uint8_t i = 0; msg[i] != '\0'; i++) LCD_write(msg[i]);
+
+        _delay_ms(200);
+        LED_Off();
+    } else {
+        LED_Red();
+        _delay_ms(200);
+        LED_Off();
+    }
+}
+
+//---------------------------------------------
+// a tiny press-type helper
+typedef enum { PRESS_NONE=0, PRESS_SHORT=1, PRESS_LONG=2 } press_t;
+
+// Debounced read + long-press detect (blocking ~ up to 800ms max)
+static press_t read_press_with_long(uint8_t pin, volatile uint8_t *pinreg_is_PIND){
+    // 1) wait for press (active low) with debounce
+    if ((*pinreg_is_PIND & (1<<pin)) == 0){
+        _delay_ms(18);
+        if ((*pinreg_is_PIND & (1<<pin)) != 0) return PRESS_NONE;
+
+        // 2) measure hold time in 10ms ticks
+        uint16_t ticks = 0;                // 10ms units
+        while ((*pinreg_is_PIND & (1<<pin)) == 0 && ticks < 120){ // cap ~1.2s
+            _delay_ms(10);
+            ticks++;
+        }
+        // 3) release debounce
+        _delay_ms(18);
+        return (ticks >= 60) ? PRESS_LONG : PRESS_SHORT;  // 60*10ms = 600ms
+    }
+    return PRESS_NONE;
+}
+
+//---------------------------------------------
+//ON/OFF Button
+#define BTN_PWR_PIN   PD4   // On/Off button on OC1B pin
+volatile uint8_t system_on = 1;   // start ON
+
+// Stop peripherals to save power while "OFF"
+static inline void Periph_Stop(void){
+    LED_Off();
+    // Stop Timer1
+    TCCR1B &= ~((1<<CS12)|(1<<CS11)|(1<<CS10));
+    TIMSK  &= ~(1<<OCIE1A);
+    // Disable ADC
+    ADCSRA &= ~(1<<ADEN);
+    // Disable USART
+    UCSRB &= ~((1<<RXEN)|(1<<TXEN)|(1<<RXCIE));
+    // Quiet the LCD (optional clear)
+    LCD_cmd(0x01);
+}
+
+// Restart peripherals after turning ON
+static inline void Periph_Start(void){
+    ADC_Init();
+    Channel_SelectAndApply(1);   // sets baud+key & shows CH#
+    Timer1_Init();               // also re-enables TIMSK OCIE1A
+}
+
+
+
+//--------------------------------------
+//main & Pins & helpers
+
+#define BTN_MODE_PIN   PD5
+#define BTN_H_PIN      PD2   // send 'H'
+#define BTN_O_PIN      PD3   // send 'O'
+#define BTN_R_PIN      PB2   // send 'R'
+
+static inline uint8_t is_low_PIND(uint8_t pin) { return !(PIND & (1 << pin)); }
+static inline uint8_t is_low_PINB(uint8_t pin) { return !(PINB & (1 << pin)); }
+
+static inline void lcd_show_mode(uint8_t mode_tx) {
+    LCD_cmd(0x01); // clear
+    if (mode_tx) { LCD_write('T'); LCD_write('x'); }
+    else         { LCD_write('R'); LCD_write('x'); }
+}
+
+static inline void lcd_show_mode_and_ch(uint8_t mode_tx){
+    LCD_cmd(0x01);
+    LCD_write('C'); LCD_write('H'); LCD_write('0' + g_current_channel);
+    LCD_write(' '); LCD_write(mode_tx ? 'T' : 'R'); LCD_write('x');
+}
+
+
+int main(void)
+{
+    //ON/OFF Button
+    DDRD &= ~(1 << BTN_PWR_PIN);
+    PORTD |= (1 << BTN_PWR_PIN);   // internal pull-up
+
+    // LCD control pins on PORTA
+    DDRA |= (1 << PA0) | (1 << PA1) | (1 << PA2);
+    DDRC  = 0xFF;                 // LCD data on PORTC
+    DDRB |= (1 << PB4) | (1 << PB5); // LEDs
+
+    // USART pins
+    DDRD &= ~(1 << PD0);          // RX input
+    DDRD |=  (1 << PD1);          // TX output
+
+    // Buttons as inputs + pull-ups
+    DDRD &= ~((1 << BTN_H_PIN) | (1 << BTN_O_PIN) | (1 << BTN_MODE_PIN));
+    DDRB &= ~(1 << BTN_R_PIN);
+    PORTD |= (1 << BTN_H_PIN) | (1 << BTN_O_PIN) | (1 << BTN_MODE_PIN); // pull-ups
+    PORTB |= (1 << BTN_R_PIN);                                          // pull-up
+
+    // External interrupts (INT0, INT1 on falling edge). INT2 is enabled as before.
+    MCUCR |= (1 << ISC01) | (1 << ISC11);
+    GICR  |= (1 << INT0) | (1 << INT1) | (1 << INT2);
+
+    sei();               // global interrupts
+
+    init_LCD();
+    ADC_Init();
+    Channel_SelectAndApply(1);  // sets baud+key and shows "CH#"
+    LED_Off();
+
+    uint8_t mode = 0;    // 0 = Receiver (default), 1 = Sender
+    uint8_t lastButtonState = (PIND & (1 << BTN_MODE_PIN));
+
+    unsigned long baud = select_channel();
+    USART_Init(baud);
+
+    Timer1_Init();       // Initialize timer (currently ~3 s threshold in ISR)
+    
+    while (1)
+{
+    // --- Power button (PD4) edge detection ---
+    static uint8_t lastPowerPin = 1;                 // pull-up idle = 1
+    uint8_t nowPowerPin = (PIND >> BTN_PWR_PIN) & 1;
+
+    if (lastPowerPin != nowPowerPin) {
+        _delay_ms(20);                               // debounce
+        nowPowerPin = (PIND >> BTN_PWR_PIN) & 1;
+        if (lastPowerPin == 1 && nowPowerPin == 0) { // falling edge = press
+            system_on ^= 1;
+            if (!system_on) {
+                // Going OFF
+                Periph_Stop();
+                LCD_cmd(0x01); LCD_write('O'); LCD_write('F'); LCD_write('F');
+            } else {
+                // Going ON
+                Periph_Start();
+                lcd_show_mode_and_ch(mode);
+            }
+        }
+    }
+    lastPowerPin = nowPowerPin;
+
+    if (!system_on) {
+    _delay_ms(20);          // light idle; keep CPU alive to poll PD4
+    continue;               // loop back to the PD4 edge-detect at the top
+    }
+
+
+    // --- Mode toggle button check (PD5) ---
+    uint8_t currentButtonState = (PIND & (1 << BTN_MODE_PIN));
+    if (lastButtonState != currentButtonState) {
+        _delay_ms(50); // debounce
+        if (is_low_PIND(BTN_MODE_PIN)) { // pressed
+            mode ^= 1;                   // toggle
+            lcd_show_mode_and_ch(mode);
+        }
+    }
+    lastButtonState = currentButtonState;
+
+    // --- Standby flag handling (Tx only) ---
+    if (send_standby_flag && mode) {
+        send_standby_flag = 0;
+
+        LED_Green();
+        LCD_write('S');
+
+        sendMessage('S');   // already encrypts & uses current channel
+
+        _delay_ms(90);
+        LED_Off();
+        standby_counter = 0;
+    }
+
+    if (mode == 1) { // Sender
+        Channel_SelectAndApply(0);
+
+        press_t p;
+
+        // PD2 -> 'H' (short) / 'A' (long)
+        p = read_press_with_long(BTN_H_PIN, &PIND);
+        if (p){
+            char c = (p == PRESS_LONG) ? 'A' : 'H';
+            sendMessage(c); LCD_write(c); standby_counter = 0; go_to_sleep();
+        }
+
+        // PD3 -> 'O' (short) / 'B' (long)
+        p = read_press_with_long(BTN_O_PIN, &PIND);
+        if (p){
+            char c = (p == PRESS_LONG) ? 'B' : 'O';
+            sendMessage(c); LCD_write(c); standby_counter = 0; go_to_sleep();
+        }
+
+        // PB2 -> 'R' (short) / 'Y' (long)
+        p = read_press_with_long(BTN_R_PIN, &PINB);
+        if (p){
+            char c = (p == PRESS_LONG) ? 'Y' : 'R';
+            sendMessage(c); LCD_write(c); standby_counter = 0; go_to_sleep();
+        }
+    }
+    else {         // Receiver
+        Channel_SelectAndApply(0);   // <<< ADD HERE (keeps baud+key in sync)
+
+        if (UCSRA & (1 << RXC)) {
+            receiveMessage();
+            go_to_sleep();
+        }
+    }
+}
+
+}
